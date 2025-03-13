@@ -1,0 +1,595 @@
+---
+title: "Baseline Modeling"
+output: html_document
+date: "2024-09-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(survival, JM, lattice, parallel, tidyverse, writexl, readxl, survminer, psych, SurvMetrics)
+```
+
+# Case Study One: MMH, SI
+## Read in train-test splits of long and short data
+```{r}
+data_sub_list <- read_rds("sconsvftall_l2so_train_test_datasets.rds")
+data_list <- read_rds("lconsvftall_l2so_train_test_datasets.rds")
+```
+
+```{r}
+treatments <- c("1", "Task") 
+dlevels <- list(Task = c("MMH", "SI"))
+rpe_cut <- 15
+
+get_surv_time_probs <- function(index, fit_treat_surv, fit_treat_time, fit_treat_strata, ids) {
+  strata_lengths <- unlist(fit_treat_strata)
+  start_indices <- cumsum(c(1, head(strata_lengths, -1)))
+  end_indices <- cumsum(strata_lengths)
+  
+  result <- lapply(seq_along(index), function(i) {
+    strata_index <- index[i]
+    start <- start_indices[strata_index]
+    end <- end_indices[strata_index]
+    list(lower = fit_treat_surv[start:end], time = fit_treat_time[start:end], ID = rep(ids[i], end - start + 1))
+  })
+  return(result)
+}
+```
+
+# Automate model fitting and evaluation
+```{r}
+# Placeholder for results
+mresults_km_train <- data.frame()
+mresults_km_test <- data.frame()
+mresults_cox_train <- data.frame()
+mresults_cox_test <- data.frame()
+
+for (treat in treatments) {
+  print(treat)
+  for (i in seq_along(data_sub_list)) {
+    print(i)
+    data_sub <- data_sub_list[[i]]$train_data
+    data <- data_list[[i]]$train_data
+    dtest <- data_list[[i]]$test_data
+    dtest_sub <- data_sub_list[[i]]$test_data
+    # Factor the treatment variable if there is one
+    if (treat != "1") {
+      df_list <- list(data_sub = data_sub, data = data, dtest = dtest, dtest_sub = dtest_sub)
+      for (j in 1:length(df_list)) {
+        df_list[[j]][[treat]] <- factor(df_list[[j]][[treat]], levels = dlevels[[treat]])
+      }
+      list2env(df_list, envir = .GlobalEnv)
+    }
+
+    # Fit survival model on training data
+    sformula <- paste("Surv(Time, Fatigue) ~", treat)
+    coxFit <- coxph(as.formula(sformula), x = TRUE, data = data_sub)
+
+    # Estimate time to fatigue based on coxFit without sensor data
+    suppressWarnings({
+      surv_fit_train <- survfit(coxFit, newdata = data_sub)
+      surv_fit_test <- survfit(coxFit, newdata = dtest_sub)
+    })
+
+    if (treat == "1") {
+      Probs_cox_train <- data.frame(
+        ID = rep(data_sub$ID, each = length(surv_fit_train$time)),
+        times = rep(surv_fit_train$time, times = nrow(data_sub)),
+        prob_cox_train = rep(surv_fit_train$lower, times = nrow(data_sub))
+      )
+      Probs_cox_test <- data.frame(
+        ID = rep(dtest_sub$ID, each = length(surv_fit_test$time)),
+        times = rep(surv_fit_test$time, times = nrow(dtest_sub)),
+        prob_cox_test = rep(surv_fit_test$lower, times = nrow(dtest_sub))
+      )
+      Probs_km_train <- data.frame(
+        ID = rep(data_sub$ID, each = length(surv_fit_train$time)),
+        times = rep(surv_fit_train$time, times = nrow(data_sub)),
+        prob_km_train = rep(surv_fit_train$lower, times = nrow(data_sub))
+      )
+      Probs_km_test <- data.frame(
+        ID = rep(dtest_sub$ID, each = length(surv_fit_test$time)),
+        times = rep(surv_fit_test$time, times = nrow(dtest_sub)),
+        prob_km_test = rep(surv_fit_test$lower, times = nrow(dtest_sub))
+      )
+      ttf_cox_train <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_train)),
+        flds = rep(i, nrow(Probs_cox_train)),
+        ID = Probs_cox_train$ID,
+        times = Probs_cox_train$times,
+        Lower = Probs_cox_train$prob_cox_train
+      )
+      ttf_cox_test <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_test)),
+        flds = rep(i, nrow(Probs_cox_test)),
+        ID = Probs_cox_test$ID,
+        times = Probs_cox_test$times,
+        Lower = Probs_cox_test$prob_cox_test
+      )
+      ttf_km_train <- cbind(
+        trts = treat,
+        flds = i,
+        ID = Probs_km_train$ID,
+        times = Probs_km_train$times,
+        Lower = Probs_km_train$prob_km_train
+      )
+      ttf_km_test <- cbind(
+        trts = treat,
+        flds = i,
+        ID = Probs_km_test$ID,
+        times = Probs_km_test$times,
+        Lower = Probs_km_test$prob_km_test
+      )
+      mresults_cox_train <- rbind(mresults_cox_train, ttf_cox_train)
+      mresults_cox_test <- rbind(mresults_cox_test, ttf_cox_test)
+      mresults_km_train <- rbind(mresults_km_train, ttf_km_train)
+      mresults_km_test <- rbind(mresults_km_test, ttf_km_test)
+    } 
+    
+    else {
+      prob_cox_train <- data.frame(cbind(times = surv_fit_train$time, surv_fit_train$lower))
+      colnames(prob_cox_train) <- c("times", paste(data_sub$ID, sep = ""))
+      Probs_cox_train <- prob_cox_train %>%
+        pivot_longer(
+          cols = -times,
+          names_to = "ID",
+          values_to = "prob_cox_train"
+        ) %>%
+        mutate(ID = as.numeric(ID)) %>%
+        arrange(ID, times)
+
+      prob_cox_test <- data.frame(cbind(times = surv_fit_test$time, surv_fit_test$lower))
+      colnames(prob_cox_test) <- c("times", paste(dtest_sub$ID, sep = ""))
+      Probs_cox_test <- prob_cox_test %>%
+        pivot_longer(
+          cols = -times,
+          names_to = "ID",
+          values_to = "prob_cox_test"
+        ) %>%
+        mutate(ID = as.numeric(ID)) %>%
+        arrange(ID, times)
+      
+      ttf_cox_train <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_train)),
+        flds = rep(i, nrow(Probs_cox_train)),
+        ID = Probs_cox_train$ID,
+        times = Probs_cox_train$times,
+        Lower = Probs_cox_train$prob_cox_train
+      )
+      ttf_cox_test <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_test)),
+        flds = rep(i, nrow(Probs_cox_test)),
+        ID = Probs_cox_test$ID,
+        times = Probs_cox_test$times,
+        Lower = Probs_cox_test$prob_cox_test
+      )
+      mresults_cox_train <- rbind(mresults_cox_train, ttf_cox_train)
+      mresults_cox_test <- rbind(mresults_cox_test, ttf_cox_test)
+
+      # Kaplan-Meier estimate
+      suppressWarnings({
+        fit_treat <- survfit(as.formula(sformula), data = data_sub)
+      })
+      fit_treat_surv <- fit_treat$lower
+      fit_treat_strata <- fit_treat$strata
+      fit_treat_time <- fit_treat$time
+      treat_cat <- names(fit_treat_strata)
+
+      indices_train <- match(data_sub[[treat]], sub(".*=", "", treat_cat))
+      indices_test <- match(dtest_sub[[treat]], sub(".*=", "", treat_cat))
+
+      # Get survival probabilities, timepoints, and IDs for each ID
+      surv_train <- get_surv_time_probs(indices_train, fit_treat_surv, fit_treat_time, fit_treat_strata, data_sub$ID)
+      surv_test <- get_surv_time_probs(indices_test, fit_treat_surv, fit_treat_time, fit_treat_strata, dtest_sub$ID)
+
+      # Flatten the list of survival probabilities, timepoints, and IDs into vectors
+      surv_probs_train <- unlist(lapply(surv_train, function(x) x$lower))
+      times_train <- unlist(lapply(surv_train, function(x) x$time))
+      ids_train <- unlist(lapply(surv_train, function(x) x$ID))
+
+      surv_probs_test <- unlist(lapply(surv_test, function(x) x$lower))
+      times_test <- unlist(lapply(surv_test, function(x) x$time))
+      ids_test <- unlist(lapply(surv_test, function(x) x$ID))
+
+      ttf_km_train <- data.frame(
+        trts = rep(treat, length(ids_train)),
+        flds = rep(i, length(ids_train)),
+        ID = ids_train,
+        times = times_train,
+        Lower = surv_probs_train
+      )
+      ttf_km_test <- data.frame(
+        trts = rep(treat, length(ids_test)),
+        flds = rep(i, length(ids_test)),
+        ID = ids_test,
+        times = times_test,
+        Lower = surv_probs_test
+      )
+      mresults_km_train <- rbind(mresults_km_train, ttf_km_train)
+      mresults_km_test <- rbind(mresults_km_test, ttf_km_test)
+    }
+  } # close folds loop
+} # close treatment loop
+
+mresults_cox_train$type <- "cox_train"
+mresults_cox_test$type <-"cox_test"
+mresults_km_train$type <- "km_train"
+mresults_km_test$type <- "km_test"
+
+results_list <- list(mresults_cox_train, mresults_cox_test,
+                     mresults_km_train, mresults_km_test)
+
+results_list <- lapply(results_list, function(df) {
+  df$rpe <- rpe_cut
+  return(df)
+})
+
+merged_df <- do.call(rbind, results_list)
+
+# mname_km_cox <- paste0(rpe_cut, "MMHSI_results.csv")
+# write.csv(merged_df, mname_km_cox, row.names = FALSE)
+```
+
+# Define metrics functions
+```{r}
+process_lower_time <- function(survPrbs_obj) {
+  # Assuming 'Median' and 'times' are column names
+  if (any(survPrbs_obj$Lower <= 0.5)) {
+    time <- survPrbs_obj$times[which(survPrbs_obj$Lower <= 0.5)[1]]
+    pred_fatigue <- 1
+  } else {
+    time <- 180
+    pred_fatigue <- 0
+  }
+  return(list(time = time, pred_fatigue = pred_fatigue))
+}
+
+calculate_mape <- function(object, pre_time) {
+    if (any(is.na(object)) | any(is.na(pre_time))) {
+        stop("The input vector cannot have NA")
+    }
+    
+    time <- object[, 1]
+    status <- object[, 2]
+    
+    if (length(time) != length(status)) {
+        stop("The lengths of time and status are not equal")
+    }
+    
+    if (length(time) != length(pre_time)) {
+        stop("The lengths of time and pre_time are not equal")
+    }
+    
+    # Avoid division by zero by checking if any time values are zero
+    if (any(time == 0)) {
+        stop("The actual time vector contains zero values, which would cause division by zero.")
+    }
+    
+    # Calculate percentage errors only for cases where status == 1
+    percentage_errors <- abs((time - pre_time) / time) * status
+    
+    # Calculate MAPE
+    mape <- sum(percentage_errors) / sum(status)
+    names(mape) <- "MAPE"
+    return(round(mape, 4))
+}
+```
+
+# Derive Metrics
+```{r}
+short_data <- read_csv("time_fixed_conservative.csv")
+long_data <- read_csv("consv_sds.csv")
+```
+
+```{r}
+probs <- read_csv("15MMHSI_results.csv")
+treatment <- "Task"
+
+# summarize by TTF
+  mtf <- probs %>% group_by(trts, flds, ID, type) %>%
+    summarise(
+              low_time = process_lower_time(cur_data())$time,
+              type = first(type),
+              trts = first(trts),
+              .groups = 'drop' 
+              )
+  
+# join true TTF by ID
+joined_data <- mtf %>% left_join(short_data %>% 
+               select(ID, Index, Time, Fatigue, !!sym(treatment)), by = c("ID"))
+
+# write.csv(joined_data, "15MMHSI_mtfs.csv", row.names = FALSE)
+```
+
+```{r}
+# joined_data <- read_csv("15MMHSI_mtfs.csv")
+
+results <- joined_data %>%  
+  group_by(trts, type, flds)  %>%  
+  summarise(
+    MAE_low_Surv = MAE(Surv(Time, Fatigue), low_time),
+    MAPE_low_Surv = calculate_mape(Surv(Time, Fatigue), low_time),
+    CND_low = if(n() > 1) Cindex(Surv(Time, Fatigue), low_time) else NA
+  )
+
+summarized_data <- results %>%
+  group_by(trts, type) %>%
+  summarise(
+    avg_MAE_low = mean(MAE_low_Surv, na.rm = TRUE),
+    avg_MAPE_low = mean(MAPE_low_Surv, na.rm = TRUE),
+    avg_CND_low = mean(CND_low, na.rm = TRUE)
+)
+
+# write.csv(summarized_data, "consv_static_lower.csv", row.names = FALSE)
+```
+
+# Case Study Two: BP
+## Read in train-test splits of long and short data
+```{r}
+rpe_cut <- 4
+sname <- paste0("shortftr_all_shoulder", rpe_cut, "_l2so_train_test_datasets.rds")
+lname <- paste0("longftr_all_shoulder", rpe_cut, "_l2so_train_test_datasets.rds")
+data_sub_list <- readRDS(sname)
+data_list <- readRDS(lname)
+```
+
+```{r}
+treatments <- c("1","experimental_condition", "bottle_mass", "picking_rate")
+
+dlevels <- list(
+          experimental_condition = c("Condition 1.5-15", "Condition 2.5-10", 
+                                     "Condition 2.5-15", "Condition 2.5-5"),
+          bottle_mass = c(1.5, 2.5),
+          picking_rate = c(5, 10, 15)
+        )
+```
+
+## Automate model fitting and evaluation
+```{r}
+# Placeholder for results
+mresults_km_train <- data.frame()
+mresults_km_test <- data.frame()
+mresults_cox_train <- data.frame()
+mresults_cox_test <- data.frame()
+
+for (treat in treatments) {
+  print(treat)
+  for (i in seq_along(data_sub_list)) {
+    print(i)
+    data_sub <- data_sub_list[[i]]$train_data
+    data <- data_list[[i]]$train_data
+    dtest <- data_list[[i]]$test_data
+    dtest_sub <- data_sub_list[[i]]$test_data
+
+    # Factor the treatment variable if there is one
+    if (treat != "1") {
+      df_list <- list(data_sub = data_sub, data = data, dtest = dtest, dtest_sub = dtest_sub)
+      for (j in 1:length(df_list)) {
+        df_list[[j]][[treat]] <- factor(df_list[[j]][[treat]], levels = dlevels[[treat]])
+      }
+      list2env(df_list, envir = .GlobalEnv)
+    }
+
+    # Fit survival model on training data
+    sformula <- paste("Surv(Time, Fatigue) ~", treat)
+    coxFit <- coxph(as.formula(sformula), x = TRUE, data = data_sub)
+
+    # Estimate time to fatigue based on coxFit without sensor data
+    suppressWarnings({
+      surv_fit_train <- survfit(coxFit, newdata = data_sub)
+      surv_fit_test <- survfit(coxFit, newdata = dtest_sub)
+    })
+
+    if (treat == "1") {
+      Probs_cox_train <- data.frame(
+        ID = rep(data_sub$ID, each = length(surv_fit_train$time)),
+        times = rep(surv_fit_train$time, times = nrow(data_sub)),
+        prob_cox_train = rep(surv_fit_train$lower, times = nrow(data_sub))
+      )
+      Probs_cox_test <- data.frame(
+        ID = rep(dtest_sub$ID, each = length(surv_fit_test$time)),
+        times = rep(surv_fit_test$time, times = nrow(dtest_sub)),
+        prob_cox_test = rep(surv_fit_test$lower, times = nrow(dtest_sub))
+      )
+      Probs_km_train <- data.frame(
+        ID = rep(data_sub$ID, each = length(surv_fit_train$time)),
+        times = rep(surv_fit_train$time, times = nrow(data_sub)),
+        prob_km_train = rep(surv_fit_train$lower, times = nrow(data_sub))
+      )
+      Probs_km_test <- data.frame(
+        ID = rep(dtest_sub$ID, each = length(surv_fit_test$time)),
+        times = rep(surv_fit_test$time, times = nrow(dtest_sub)),
+        prob_km_test = rep(surv_fit_test$lower, times = nrow(dtest_sub))
+      )
+      ttf_cox_train <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_train)),
+        flds = rep(i, nrow(Probs_cox_train)),
+        ID = Probs_cox_train$ID,
+        times = Probs_cox_train$times,
+        Lower = Probs_cox_train$prob_cox_train
+      )
+      ttf_cox_test <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_test)),
+        flds = rep(i, nrow(Probs_cox_test)),
+        ID = Probs_cox_test$ID,
+        times = Probs_cox_test$times,
+        Lower = Probs_cox_test$prob_cox_test
+      )
+      ttf_km_train <- cbind(
+        trts = treat,
+        flds = i,
+        ID = Probs_km_train$ID,
+        times = Probs_km_train$times,
+        Lower = Probs_km_train$prob_km_train
+      )
+      ttf_km_test <- cbind(
+        trts = treat,
+        flds = i,
+        ID = Probs_km_test$ID,
+        times = Probs_km_test$times,
+        Lower = Probs_km_test$prob_km_test
+      )
+      mresults_cox_train <- rbind(mresults_cox_train, ttf_cox_train)
+      mresults_cox_test <- rbind(mresults_cox_test, ttf_cox_test)
+      mresults_km_train <- rbind(mresults_km_train, ttf_km_train)
+      mresults_km_test <- rbind(mresults_km_test, ttf_km_test)
+    } else {
+      prob_cox_train <- data.frame(cbind(times = surv_fit_train$time, surv_fit_train$lower))
+      colnames(prob_cox_train) <- c("times", paste(data_sub$ID, sep = ""))
+      Probs_cox_train <- prob_cox_train %>%
+        pivot_longer(
+          cols = -times,
+          names_to = "ID",
+          values_to = "prob_cox_train"
+        ) %>%
+        mutate(ID = as.numeric(ID)) %>%
+        arrange(ID, times)
+
+      prob_cox_test <- data.frame(cbind(times = surv_fit_test$time, surv_fit_test$lower))
+      colnames(prob_cox_test) <- c("times", paste(dtest_sub$ID, sep = ""))
+      Probs_cox_test <- prob_cox_test %>%
+        pivot_longer(
+          cols = -times,
+          names_to = "ID",
+          values_to = "prob_cox_test"
+        ) %>%
+        mutate(ID = as.numeric(ID)) %>%
+        arrange(ID, times)
+      
+      ttf_cox_train <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_train)),
+        flds = rep(i, nrow(Probs_cox_train)),
+        ID = Probs_cox_train$ID,
+        times = Probs_cox_train$times,
+        Lower = Probs_cox_train$prob_cox_train
+      )
+      ttf_cox_test <- data.frame(
+        trts = rep(treat, nrow(Probs_cox_test)),
+        flds = rep(i, nrow(Probs_cox_test)),
+        ID = Probs_cox_test$ID,
+        times = Probs_cox_test$times,
+        Lower = Probs_cox_test$prob_cox_test
+      )
+      mresults_cox_train <- rbind(mresults_cox_train, ttf_cox_train)
+      mresults_cox_test <- rbind(mresults_cox_test, ttf_cox_test)
+
+      # Kaplan-Meier estimate
+      suppressWarnings({
+        fit_treat <- survfit(as.formula(sformula), data = data_sub)
+      })
+      fit_treat_surv <- fit_treat$lower
+      fit_treat_strata <- fit_treat$strata
+      fit_treat_time <- fit_treat$time
+      treat_cat <- names(fit_treat_strata)
+
+      indices_train <- match(data_sub[[treat]], sub(".*=", "", treat_cat))
+      indices_test <- match(dtest_sub[[treat]], sub(".*=", "", treat_cat))
+
+      # Get survival probabilities, timepoints, and IDs for each ID
+      surv_train <- get_surv_time_probs(indices_train, fit_treat_surv, fit_treat_time, fit_treat_strata, data_sub$ID)
+      surv_test <- get_surv_time_probs(indices_test, fit_treat_surv, fit_treat_time, fit_treat_strata, dtest_sub$ID)
+
+      # Flatten the list of survival probabilities, timepoints, and IDs into vectors
+      surv_probs_train <- unlist(lapply(surv_train, function(x) x$lower))
+      times_train <- unlist(lapply(surv_train, function(x) x$time))
+      ids_train <- unlist(lapply(surv_train, function(x) x$ID))
+
+      surv_probs_test <- unlist(lapply(surv_test, function(x) x$lower))
+      times_test <- unlist(lapply(surv_test, function(x) x$time))
+      ids_test <- unlist(lapply(surv_test, function(x) x$ID))
+
+      ttf_km_train <- data.frame(
+        trts = rep(treat, length(ids_train)),
+        flds = rep(i, length(ids_train)),
+        ID = ids_train,
+        times = times_train,
+        Lower = surv_probs_train
+      )
+      ttf_km_test <- data.frame(
+        trts = rep(treat, length(ids_test)),
+        flds = rep(i, length(ids_test)),
+        ID = ids_test,
+        times = times_test,
+        Lower = surv_probs_test
+      )
+      mresults_km_train <- rbind(mresults_km_train, ttf_km_train)
+      mresults_km_test <- rbind(mresults_km_test, ttf_km_test)
+    }
+  } # close folds loop
+} # close treatment loop
+
+mresults_cox_train$type <- "cox_train"
+mresults_cox_test$type <-"cox_test"
+mresults_km_train$type <- "km_train"
+mresults_km_test$type <- "km_test"
+
+results_list <- list(mresults_cox_train, mresults_cox_test,
+                     mresults_km_train, mresults_km_test)
+
+results_list <- lapply(results_list, function(df) {
+  df$rpe <- rpe_cut
+  return(df)
+})
+
+merged_df <- do.call(rbind, results_list)
+
+mname_km_cox <- paste0(rpe_cut, "BP_results.csv")
+# write.csv(merged_df, mname_km_cox, row.names = FALSE)
+```
+
+```{r}
+short_data <- read_csv(paste0("short_data",rpe_cut, "_r0.5.csv"))
+
+process_lower_time <- function(survPrbs_obj) {
+  if (any(survPrbs_obj$Lower <= 0.5)) {
+    time <- survPrbs_obj$times[which(survPrbs_obj$Lower <= 0.5)[1]]
+    pred_fatigue <- 1
+  } else {
+    time <- 45
+    pred_fatigue <- 0
+  }
+  return(list(time = time, pred_fatigue = pred_fatigue))
+}
+```
+
+## Calculate MTF metrics and Join with True TTF for each ID
+```{r}
+treatment <- "experimental_condition" 
+
+probs <- read_csv("4BP_results.csv") 
+# summarize by TTF
+mtf <- probs %>% group_by(trts, flds, ID, type) %>%
+    summarise(
+      low_time = process_lower_time(cur_data())$time,
+              type = first(type),
+              trts = first(trts),
+              .groups = 'drop' 
+              )
+  
+  # join true TTF by ID
+  joined_data <- mtf %>% left_join(short_data %>% # rpe_values,  Index,
+                    dplyr::select(ID, Time, Fatigue, !!sym(treatment)), by = c("ID"))
+
+# write.csv(joined_data, "4Shoulder_ltfs.csv")
+```
+
+```{r}
+results <- joined_data %>%  
+  group_by(trts, type, flds)  %>%  
+  summarise(
+    MAE_low_Surv = MAE(Surv(Time, Fatigue), low_time),
+    MAPE_low_Surv = calculate_mape(Surv(Time, Fatigue), low_time),
+    CND_low = if(n() > 1) Cindex(Surv(Time, Fatigue), low_time) else NA
+  )
+
+summarized_data <- results %>%
+  group_by(trts, type) %>%
+  summarise(
+    avg_MAE_low = mean(MAE_low_Surv, na.rm = TRUE),
+    avg_MAPE_low = mean(MAPE_low_Surv, na.rm = TRUE),
+    avg_CND_low = mean(CND_low, na.rm = TRUE)
+)
+
+# write.csv(summarized_data, "4Shoulder_static_lower.csv", row.names = FALSE)
+```
+

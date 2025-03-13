@@ -1,0 +1,572 @@
+---
+title: "Joint modeling"
+author: "Lin Lu"
+date: "2024-05-25"
+output: html_document
+---
+
+# Package setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(survival, JM, lattice, parallel, dplyr, tidyr, readr, writexl, SurvMetrics)
+set.seed(123)
+```
+
+# Joint modeling
+
+## lmeFit: 
+note that for case study two, the biomarkers are multiplied by 100 given their variation
+```{r}
+getLmeFit <- function(lmeForm, ltime, treat, keyIndex, lfeature, ldata) {
+  # Fit LME model on training data
+  lmeFit <- tryCatch({
+    if (lmeForm == "RIRS") {
+      lformula <- as.formula(paste(lfeature, " ~ ", ltime))
+      rformula <- as.formula(paste("~ ", ltime, " | ", keyIndex))
+      lme(lformula, random = rformula, data = ldata)
+    } else if (lmeForm == "RI") {
+      lformula <- as.formula(paste(lfeature, "~", ltime))
+      rformula <- as.formula(paste("~ 1 | ", keyIndex))
+      lme(lformula, random = rformula, data = ldata)
+    } else if (lmeForm == "ITA") {
+      lformula <- as.formula(paste(lfeature, "~", ltime, " + ", ltime, ":", treat))
+      rformula <- as.formula(paste("~ ", ltime, " | ", keyIndex))
+      lme(lformula, random = rformula, data = ldata)
+    } else {
+      NULL
+    }
+  }, error = function(e) {
+    e$message
+  })
+  return (lmeFit)
+}
+
+# lmeFit <- getLmeFit(lmeForm, ltime, treat, keyIndex, lfeature, ldata)
+```
+
+## coxFit
+```{r}
+getCoxFit <- function(stime, event, treat, sdata) {
+  # Fit survival model on training data
+  coxFit<-tryCatch({
+    sformula <- as.formula(paste("Surv(", stime, ", ", event, ") ~", treat))
+    coxph(sformula, x=TRUE, data = sdata)
+  }, error = function(e) {
+    e$message
+  })
+  return (coxFit)
+}
+
+# coxFit <- getCoxFit(stime, event, treat, sdata)
+```
+
+## jointFit
+```{r}
+getJointFit <- function(lmeFit, coxFit, jointForm, dform, ltime) {
+  # Fit joint model based on selected form
+  if (jointForm == "value") {
+    jointFit <- tryCatch({
+      jointModel(lmeFit, coxFit, timeVar = ltime, method = "piecewise-PH-aGH")
+    }, error = function(e) {
+      e$message
+    }) 
+  } else if (jointForm == "slope" || jointForm == "both") {
+    jointFit <- tryCatch({
+      jointModel(lmeFit, coxFit, timeVar = ltime, method = "piecewise-PH-aGH", 
+                 parameterization = jointForm, derivForm = dform)
+    }, error = function(e) {
+      e$message
+    })
+  }
+  # print(summary(jointFit)$`CoefTable-Event`['Assoct',4])
+  return(jointFit)
+}
+
+# jointFit<- getJointFit(lmeFit, coxFit, jointForm, dform, ltime)
+```
+
+## treatments
+```{r}
+getTreatments <- function(lmeForm, treatmentList) {
+  if (lmeForm == "RI" || lmeForm == "RIRS") {
+    return(append(treatmentList, "1"))
+  } else {
+    return(treatmentList)
+  }
+}
+
+# treatments <- getTreatments(lmeForm, treatmentList)
+```
+
+## jointForms
+```{r}
+getJointForms <- function(lmeForm) {
+  if (lmeForm == "RIRS") {
+    return(c("value", "slope", "both"))
+  } else if (lmeForm == "RI") {
+    return(c("value"))
+  } else if (lmeForm == "ITA") {
+    return(c("value", "slope", "both"))
+  } else {
+    return(NA)
+  }
+}
+
+# jointForms <- getJointForms(lmeForm)
+```
+
+## dform
+```{r}
+getDform <- function(lmeForm, treat) {
+  # derivative form for lme model
+  if (lmeForm == "ITA") {
+    itaFormula <- as.formula(paste("~ 1 +", treat))
+    dform <- list(fixed = itaFormula, indFixed = 2:3, random = ~1, indRandom = 2)
+  } else if (lmeForm == "RIRS") {
+    dform <- list(fixed = ~ 1, indFixed = 2, random = ~ 1, indRandom = 2)
+  } else {
+    dform <- NULL
+  }
+  return(dform)
+}
+
+# dform <- getDform(lmeForm, treat)
+```
+
+## model training performance
+```{r}
+getTrainingPerformance <- function(jointFit, jointForm, lfeature, fold, treat, rpeCut, lmeForm) {
+  SIGs_slp <- NA
+  Binary_SIGs_slp <- NA
+  SIGs <- NA
+  Binary_SIGs <- NA
+  # print("In evaluation function")
+  # print(summary(jointFit)$`CoefTable-Event`['Assoct',4])
+  # Compute AIC and BIC
+  AICs <- tryCatch({
+    AIC(jointFit)
+  }, error = function(e) {
+    e$message
+  })
+  BICs <- tryCatch({
+    BIC(jointFit)
+  }, error = function(e) {
+    e$message
+  })
+  if (jointForm == "slope" || jointForm == "both") {
+    SIGs_slp <- tryCatch({
+      summary(jointFit)$`CoefTable-Event`['Assoct.s',4]
+    }, error = function(e) {
+      e$message
+    })
+    Binary_SIGs_slp <- tryCatch({
+      SIGs_slp <=0.05
+    }, error = function(e) {
+      e$message
+    })
+  }
+  if (jointForm == "value" || jointForm == "both") {
+    SIGs <- tryCatch({
+      summary(jointFit)$`CoefTable-Event`['Assoct',4]
+    }, error = function(e) {
+      e$message
+    })
+    Binary_SIGs <- tryCatch({
+      SIGs <=0.05
+    }, error = function(e) {
+      e$message
+    })
+  }
+  return(data.frame(
+    SIGs_slp <- SIGs_slp,
+    Binary_SIGs_slp <- Binary_SIGs_slp,
+    SIGs <- SIGs,
+    Binary_SIGs <- Binary_SIGs,
+    AICs <- AICs,
+    BICs <- BICs,
+    jointForms <- jointForm,
+    lfeatures <- lfeature,
+    treatments <- treat,
+    folds <- fold,
+    rpeCuts <- rpeCut,
+    lmeForms <- lmeForm
+  ))
+}
+```
+
+## prediction performance
+```{r}
+# Define a function to perform survival probability, median calculation and MAE computation
+getPredictionPerformance <- function(jointFit, ldata, lastTime, lastTimeIndex,
+                                     predStart, predEnd, predInterval,
+                                     jointForm, lfeature, fold, treat,
+                                     rpeCut, lmeForm, predictionType,
+                                     keyIndex = "ID", value = "value") {
+  predictResult <- NA
+  invalidId <- lastTime[is.na(lastTime[[value]]),][[keyIndex]]
+  validLastTime <- lastTime[!is.na(lastTime[[value]]),]
+  validLdata <- ldata[!ldata[[keyIndex]] %in% invalidId, ]
+  indexOrder <- unique(validLdata[[keyIndex]])
+  validLastTimeOrdered <- validLastTime %>% slice(match(indexOrder, !!sym(keyIndex)))
+  tryCatch({
+    suppressWarnings({
+    # Compute predicted error of median time to fatigue
+    survProbs <- survfitJM(jointFit, newdata = validLdata, idVar = keyIndex, 
+                           last.time = validLastTimeOrdered[[value]], 
+                           survTimes = seq(predStart, predEnd, by=predInterval))
+    })
+    predictResult <- bind_rows(lapply(names(survProbs[[1]]), function(id) {
+      df <- as.data.frame(survProbs[[1]][[id]])
+      # Use mutate to add the ID column
+      rownames(df) <- NULL
+      df <- mutate(df, ID = as.numeric(id))
+      df$lfeatures <- lfeature
+      df$treatments <- treat
+      df$jointForms <- jointForm
+      df$folds <- fold
+      df$rpeCuts <- rpeCut
+      df$lmeForms <- lmeForm
+      df$predictionType <- predictionType
+      df$lastTimeIndex <- lastTimeIndex
+      return(df)
+    }))
+    # Return a list containing all relevant results
+  }, error = function(e) {
+    # Optionally, handle errors specifically if needed
+    # list(error = e$message)
+    predictResult<-NA
+  })
+  return(predictResult)
+}
+```
+
+## get data
+```{r}
+getDataFromFold <- function(data_list, data_sub_list, fold) {
+  ldataTrain <- data_list[[fold]]$train_data
+  sdataTrain <- data_sub_list[[fold]]$train_data
+  ldataTest <- data_list[[fold]]$test_data
+  sdataTest <- data_sub_list[[fold]]$test_data
+  return(list(
+    ldataTrain = ldataTrain,
+    sdataTrain = sdataTrain,
+    ldataTest = ldataTest,
+    sdataTest = sdataTest
+  ))
+}
+```
+
+## get last time
+```{r}
+getLastTime <- function(ldata, keyIndex, ltime, lastTimeIndex) {
+  return(ldata |> group_by(!!sym(keyIndex)) |> summarise(value = (!!sym(ltime))[lastTimeIndex]))
+}
+```
+
+## train model
+```{r}
+jointFitPredict <- function(data_list, data_sub_list, lfeatureList, treatmentList, lastTimeIndexList, ltime, stime, keyIndex, event, predStart, predEnd, predInterval, rpeCut, wname) {
+  lmeFormList = c("RIRS", "RI", "ITA") # 
+  # default dform as "RI" 
+  dformRirs <- getDform("RIRS",)
+  for (lmeForm in lmeFormList) {
+    treatments <- getTreatments(lmeForm, treatmentList)
+    jointForms <- getJointForms(lmeForm)
+    for (lfeature in lfeatureList) {
+      for (fold in seq_along(data_sub_list)) {
+        dataInput <- getDataFromFold(data_list, data_sub_list, fold)
+        if (lmeForm == "RIRS" || lmeForm == "RI") {
+          lmeFit <- getLmeFit(lmeForm, ltime, NULL, keyIndex, lfeature, dataInput$ldataTrain)
+          dform <- dformRirs
+        }
+        if (lmeForm == "RI") {
+          dform <- NULL
+        }
+        for (treat in treatments) {
+          # print(treat)
+          if (lmeForm == "ITA") {
+            lmeFit <- getLmeFit(lmeForm, ltime, treat, keyIndex, lfeature, dataInput$ldataTrain)
+            dform <- getDform(lmeForm, treat)
+          }
+          coxFit <- getCoxFit(stime, event, treat, dataInput$sdataTrain)
+          for (jointForm in jointForms) {
+            jointFit <- getJointFit(lmeFit, coxFit, jointForm, dform, ltime)
+            # Calculate SIG, AIC, BIC
+            trainingPerformance <- getTrainingPerformance(jointFit, jointForm, lfeature, fold, treat, rpeCut, lmeForm)
+            write.table(trainingPerformance, wname$trainName, append = TRUE, sep = ",", col.names = FALSE, row.names = FALSE)
+            # Calculate the predicted probabilities
+            for (i in seq_along(lastTimeIndexList)) {
+              lastTimeIndex <- lastTimeIndexList[i]
+              predictTrainPerformance <- getPredictionPerformance(jointFit, dataInput$ldataTrain, getLastTime(dataInput$ldataTrain, keyIndex, ltime, lastTimeIndex), lastTimeIndex, predStart[i], predEnd, predInterval, jointForm, lfeature, fold, treat, rpeCut, lmeForm, "Train", keyIndex, "value")
+              write.table(predictTrainPerformance, wname$predictTrainName[[i]], append = TRUE, sep = ",", col.names = FALSE, row.names = FALSE)
+              predictTestPerformance <- getPredictionPerformance(jointFit, dataInput$ldataTest, getLastTime(dataInput$ldataTest, keyIndex, ltime, lastTimeIndex), lastTimeIndex, predStart[i], predEnd, predInterval, jointForm, lfeature, fold, treat, rpeCut, lmeForm, "Test", keyIndex, "value")
+              write.table(predictTestPerformance, wname$predictTestName[[i]], append = TRUE, sep = ",", col.names = FALSE, row.names = FALSE)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+## input parameters
+
+### BP
+```{r}
+rpe_cut <- 4
+sname <- paste0("shortftr_all_shoulder", rpe_cut, "_l2so_train_test_datasets.rds")
+lname <- paste0("longftr_all_shoulder", rpe_cut, "_l2so_train_test_datasets.rds")
+data_sub_list <- readRDS(sname)
+data_list <- readRDS(lname)
+nfold <- length(data_sub_list)
+```
+
+```{r}
+treatmentList <- c("experimental_condition", "bottle_mass", "picking_rate")
+lfeatureList <- c("wrist_acc_std", "wrist_acc_mad", "upperarm_acc_perc25", 
+                  "wrist_jerk_perc25", "upperarm_jerk_perc25")
+
+ltime <- "Time1"
+stime <- "Time"
+event <- "Fatigue"
+keyIndex <- "ID"
+
+lastTimeIndexList <- c(4, 5, 6, 7)
+predStart <- c(11, 13.5, 15.5, 19) # based on the maximum time around each last time index
+predEnd <- 45.5
+predInterval <- 0.5
+```
+
+```{r}
+wname <- list(
+  trainName = paste0(rpe_cut, "_model_comparison_results.csv"),
+  predictTrainName = list(),
+  predictTestName = list()
+)
+for (i in seq_along(lastTimeIndexList)) {
+  wname$predictTrainName[[i]] <- paste0(rpe_cut, "_train_predict_cut_index_", lastTimeIndexList[i], "_results_temp.csv")
+  wname$predictTestName[[i]] <- paste0(rpe_cut, "_test_predict_cut_index_", lastTimeIndexList[i], "_results_temp.csv")
+}
+
+result <- jointFitPredict(data_list, data_sub_list, lfeatureList, treatmentList, lastTimeIndexList, ltime, stime, keyIndex, event, predStart, predEnd, predInterval, rpe_cut, wname) 
+```
+
+### MMHSI
+```{r}
+rpe_cut <- "consv"
+sname <- paste0("sconsvftall", "_l2so_train_test_datasets.rds")
+lname <- paste0("lconsvftall", "_l2so_train_test_datasets.rds")
+data_sub_list <- readRDS(sname)
+data_list <- readRDS(lname)
+nfold <- length(data_sub_list)
+```
+
+```{r}
+treatmentList <- c("Task")
+lfeatureList <- c("Wrist_jerk_Mean")
+
+ltime <- "Time1"
+stime <- "Time"
+event <- "Fatigue"
+keyIndex <- "ID"
+lastTimeIndexList <- c(5, 6, 7, 8)
+predStart <- c(60, 70, 80, 90)
+predEnd <- 180
+predInterval <- 10
+```
+
+# Evaluation metrics
+
+## BP
+```{r}
+name <- "^4_.*_temp\\.csv$"
+list_of_names <- list.files(pattern = name)
+
+combined_df <- data.frame()
+ 
+for (name in list_of_names) {
+  # Read each file into a list of data frames
+  print(name)
+ file <- read_csv(name, col_names = FALSE) %>%
+          na.omit() %>%
+        # Set column names immediately after reading and omitting NA
+          setNames(c("times", "Mean", "Median", "Lower", "Upper", 
+                     "ID", "lfts", "trts", "jfts", "flds",
+                     "rpe_values", "lme", "type", "lastTimeIndex"))
+ 
+  # file <- read_csv(name)
+ combined_df <- rbind(combined_df, file)
+}  
+# write_csv(combined_df, "4_probs.csv")
+```
+
+```{r}
+process_lower_time <- function(survPrbs_obj) {
+    # Assuming 'Median' and 'times' are column names
+    if (any(round(survPrbs_obj$Lower,1) <= 0.5)) {
+      time <- survPrbs_obj$times[which(round(survPrbs_obj$Lower,1) <= 0.5)[1]]
+      pred_fatigue <- 1
+    } else {
+      time <- 45
+      pred_fatigue <- 0
+    }
+    return(list(time = time, pred_fatigue = pred_fatigue))
+  }
+```
+
+```{r}
+combined_data <- data.frame()
+treatment <- "experimental_condition"
+short_data <- read_csv("short_data4_r0.5.csv")
+combined_df <- read_csv("4_probs.csv")
+
+mtf <- combined_df %>% 
+  group_by(rpe_values, lfts, lme, jfts, lastTimeIndex, trts, flds, ID, type) %>%
+  summarise(
+              low_time = process_lower_time(cur_data())$time,
+              type = first(type),
+              rpe_values = first(rpe_values),
+              .groups = 'drop' 
+              )
+# join true TTF by ID
+joined_data <- mtf %>% left_join(short_data %>% 
+                  dplyr::select(ID, Index, Time, Fatigue, !!sym(treatment)), by = c("ID"))
+  # bind each joined results if multiple prob files read in
+combined_data <- rbind(combined_data, joined_data)
+  
+# write_csv(combined_data, "4_ptfs.csv")
+```
+
+```{r}
+calculate_mape <- function(object, pre_time) {
+    if (any(is.na(object)) | any(is.na(pre_time))) {
+        stop("The input vector cannot have NA")
+    }
+    time <- object[, 1]
+    status <- object[, 2]
+    if (length(time) != length(status)) {
+        stop("The lengths of time and status are not equal")
+    }
+    if (length(time) != length(pre_time)) {
+        stop("The lengths of time and pre_time are not equal")
+    }
+    # Avoid division by zero by checking if any time values are zero
+    if (any(time == 0)) {
+        stop("The actual time vector contains zero values, which would cause division by zero.")
+    }
+    # Calculate percentage errors only for cases where status == 1
+    percentage_errors <- abs((time - pre_time) / time) * status
+    # Calculate MAPE
+    mape <- sum(percentage_errors) / sum(status)
+    names(mape) <- "MAPE"
+    return(round(mape, 4))
+}
+```
+
+```{r}
+# combined_data <- read_csv("4_ptfs.csv")
+  
+results <- combined_data %>% # lme, lfts, jfts, flds
+   group_by(lfts, lme, jfts, lastTimeIndex, trts, type, flds) %>%
+    summarise(
+      MAE_low_Surv = MAE(Surv(Time, Fatigue), low_time),
+      CND_low_Surv = if(n() > 1) Cindex(Surv(Time, Fatigue), low_time) else NA,
+      MAPE_low_Surv = calculate_mape(Surv(Time, Fatigue), low_time)
+    ) 
+```
+
+```{r}
+summarized_data <- results  %>%
+  group_by(lme, lfts, jfts, trts, type, lastTimeIndex) %>%
+  summarise(
+    avg_MAE_low_Surv = mean(MAE_low_Surv, na.rm = TRUE),
+    avg_MAPE_low_Surv = mean(MAPE_low_Surv, na.rm = TRUE),
+    avg_CND_low_Surv = mean(CND_low_Surv, na.rm = TRUE)
+)
+
+# write_csv(summarized_data, "4_joint_lower_metrics.csv")
+```
+
+## MMHSI
+
+```{r}
+name <- "consv_.*_temp"
+list_of_names <- list.files(pattern = name)
+combined_df <- data.frame()
+
+for (name in list_of_names) {
+  # Read each file into a list of data frames
+ file <- read_csv(name, col_names = FALSE) %>%
+          na.omit() %>%
+        # Set column names immediately after reading and omitting NA
+          setNames(c("times", "Mean", "Median", "Lower", "Upper", 
+                     "ID", "lfts", "trts", "jfts", "flds",
+                     "rpe_values", "lme", "type", "lastTimeIndex"))
+ 
+ combined_df <- rbind(combined_df, file)
+}  
+
+# write.csv(combined_df, "consv_probs.csv", row.names = FALSE)
+```
+
+```{r}
+process_lower_time <- function(survPrbs_obj) {
+    # Assuming 'Median' and 'times' are column names
+    if (any(survPrbs_obj$Lower <= 0.5)) {
+      time <- survPrbs_obj$times[which(survPrbs_obj$Lower <= 0.5)[1]]
+      pred_fatigue <- 1
+    } else {
+      time <- 180
+      pred_fatigue <- 0
+    }
+    return(list(time = time, pred_fatigue = pred_fatigue))
+}
+```
+
+```{r}
+# combined_df <- read_csv("consv_probs.csv")
+combined_data <- data.frame()
+treatment <- "Task"
+short_data <- read_csv("time_fixed_conservative.csv")
+
+ptf <- combined_df %>% 
+  group_by(rpe_values, lfts, lme, jfts, lastTimeIndex, trts, flds, ID, type) %>%
+  summarize(
+              low_time = process_lower_time(cur_data())$time,
+              type = first(type),
+              .groups = 'drop' 
+              )
+# join true TTF by ID
+combined_data <- ptf %>% left_join(short_data %>% 
+                  select(ID, Index, Time, Fatigue, !!sym(treatment)), by = c("ID"))
+  
+# write_csv(combined_data, "consv_ptfs.csv")
+```
+
+```{r}
+# combined_data <- read_csv("consv_ptfs.csv")
+results <- combined_data %>%
+ group_by(lfts, lme, jfts, lastTimeIndex, trts, type, flds) %>%
+  summarise(
+      MAE_low_Surv = MAE(Surv(Time, Fatigue), low_time),
+      CND_low_Surv = if(n() > 1) Cindex(Surv(Time, Fatigue), low_time) else NA,
+      MAPE_low_Surv = calculate_mape(Surv(Time, Fatigue), low_time)
+  )
+```
+
+```{r}
+summarized_data <- results  %>%
+  group_by(lme, lfts, jfts, trts, type, lastTimeIndex) %>%
+  summarise(
+    # MAE_Surv
+    avg_MAE_low_Surv = mean(MAE_low_Surv, na.rm = TRUE),
+    # MAPE_Surv
+    avg_MAPE_low_Surv = mean(MAPE_low_Surv, na.rm = TRUE),
+    # CND_Surv
+    avg_CND_low_Surv = mean(CND_low_Surv, na.rm = TRUE)
+)
+
+# write_csv(summarized_data, "15_joint_metrics.csv")
+```
+

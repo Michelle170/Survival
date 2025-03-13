@@ -1,0 +1,199 @@
+---
+title: "Data preprocessing"
+output: html_notebook
+date: "2024-09-30"
+---
+# Package setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(survival, JM, lattice, parallel, dplyr, tidyr, readr, writexl, readxl, survminer, psych, pheatmap, rmcorr)
+set.seed(123)
+```
+# Case Study One: MMH, SI
+
+## Read in the short and long forms of data
+```{r}
+short_data <- read_csv("time_fixed_conservative.csv")
+long_data <- read_csv("consv_sds.csv")
+```
+
+## Leave two subjects out train-test splits
+```{r}
+d <- short_data
+l <- long_data
+
+treatmentList <- c("Task")
+dlevels <- list(
+          Task = c("MMH", "SI")
+        )
+
+library(combinat)
+set.seed(123)
+# Number of observations
+n <- unique(d$Index)
+# Number of combinations to leave two out
+p <- 2
+# Generate all combinations of leaving two out
+combinations <- combinat::combn(n, p)
+
+# List to store train-validation datasets
+train_test_datasets <- list()
+train_test_sub_datasets <- list()
+
+# Iterate over combinations
+for (i in seq(ncol(combinations))) {
+  testing_indices <- combinations[, i]
+  training_indices <- setdiff(n, testing_indices) # 1:length(n)
+  
+  # Create train-validation datasets
+  training_data_sub <- d[d$Index %in% training_indices,]
+  testing_data_sub <- d[d$Index %in% testing_indices,] 
+  
+  train_test_sub_datasets[[i]] <- list(train_data = training_data_sub, test_data = testing_data_sub)
+  
+  training_data <- l[l$Index %in% training_indices,]
+  testing_data <- l[l$Index %in% testing_indices,]
+  
+  for (treat in treatmentList) {
+    training_data[[treat]] <- factor(training_data[[treat]], level = dlevels[[treat]])
+    testing_data[[treat]] <- factor(testing_data[[treat]], level = dlevels[[treat]])
+    
+    training_data_sub[[treat]] <- factor(training_data_sub[[treat]], level = dlevels[[treat]])
+    testing_data_sub[[treat]] <- factor(testing_data_sub[[treat]], level = dlevels[[treat]])
+    
+  }
+  train_test_datasets[[i]] <- list(train_data = training_data, test_data = testing_data)
+    train_test_sub_datasets[[i]] <- list(train_data = training_data_sub, test_data = testing_data_sub)
+}
+```
+
+```{r}
+# saveRDS(train_test_datasets, file = "lconsvftall_l2so_train_test_datasets.rds")
+# saveRDS(train_test_sub_datasets, file ="sconsvftall_l2so_train_test_datasets.rds")
+```
+
+## Select sensor features that have >=0.2 correlations with fatigue state.
+```{r}
+# Input the data and lme_form for the current run
+rpe_cut <- "consv"
+
+sname <- paste0("s", rpe_cut, "ftall_l2so_train_test_datasets.rds")
+lname <- paste0("l", rpe_cut, "ftall_l2so_train_test_datasets.rds")
+data_sub_list <- readRDS(sname)
+data_list <- readRDS(lname)
+```
+
+```{r}
+feature_list <- list()
+all_features <- c()
+
+for (i in seq_along(data_sub_list))
+  {
+    data <- data_list[[i]]$train_data
+
+    cor_matrix <- mixedCor(data=data, c=10:72, d=6)$rho
+    cfeatures <- data.frame(cor_matrix) |> select (State)
+    cfeatures_indices <- apply(cfeatures, 2, function(x) which(abs(x) >= 0.2))
+    cfeature_names <- rownames(cfeatures_indices)[-1]
+
+    feature_list[[i]] <- cfeature_names
+    all_features <- c(all_features, unlist(cfeature_names))
+}
+
+View(all_features)
+sort(table(all_features), decreasing = TRUE)
+```
+
+# Case Study Two: BP
+## Read in the short and long forms of data
+```{r}
+short_data <- read_csv("short_data4_r0.5.csv")
+long_data <- read_csv("long_data4_r0.5.csv")
+```
+
+## Leave two subjects out train-test splits
+```{r}
+d <- short_data
+l <- long_data
+
+treatmentList <- c("experimental_condition", "bottle_mass", "picking_rate")
+dlevels <- list(
+          experimental_condition = c("Condition 1.5-15", "Condition 2.5-10", "Condition 2.5-15", "Condition 2.5-5"),
+          bottle_mass = c(1.5, 2.5),
+          picking_rate = c(5, 10, 15)
+        )
+
+library(combinat)
+set.seed(123)
+# Number of observations
+n <- unique(d$Index)
+# Number of combinations to leave two out
+p <- 2
+# Generate all combinations of leaving two out
+combinations <- combinat::combn(n, p)
+
+# List to store train-validation datasets
+train_test_datasets <- list()
+train_test_sub_datasets <- list()
+
+# Iterate over combinations
+for (i in seq(ncol(combinations))) {
+  testing_indices <- combinations[, i]
+  training_indices <- setdiff(n, testing_indices) # 1:length(n)
+  
+  # Create train-validation datasets
+  training_data_sub <- d[d$Index %in% training_indices,]
+  testing_data_sub <- d[d$Index %in% testing_indices,] 
+  
+  train_test_sub_datasets[[i]] <- list(train_data = training_data_sub, test_data = testing_data_sub)
+  
+  training_data <- l[l$Index %in% training_indices,]
+  testing_data <- l[l$Index %in% testing_indices,]
+  
+  for (treat in treatmentList) {
+    training_data[[treat]] <- factor(training_data[[treat]], level = dlevels[[treat]])
+    testing_data[[treat]] <- factor(testing_data[[treat]], level = dlevels[[treat]])
+    
+    training_data_sub[[treat]] <- factor(training_data_sub[[treat]], level = dlevels[[treat]])
+    testing_data_sub[[treat]] <- factor(testing_data_sub[[treat]], level = dlevels[[treat]])
+    
+  }
+  train_test_datasets[[i]] <- list(train_data = training_data, test_data = testing_data)
+    train_test_sub_datasets[[i]] <- list(train_data = training_data_sub, test_data = testing_data_sub)
+}
+```
+
+```{r}
+# saveRDS(train_test_datasets, file = "longftr_all_shoulder4_l2so_train_test_datasets.rds")
+# saveRDS(train_test_sub_datasets, file ="shortftr_all_shoulder4_l2so_train_test_datasets.rds")
+```
+
+## Select sensor features that have >=0.2 correlations with fatigue state.
+```{r}
+# Input the data and lme_form for the current run
+# rpe_cut <- "4"
+# 
+# data_sub_list <- readRDS("shortftr_all_shoulder4_l2so_train_test_datasets.rds")
+# data_list <- readRDS("longftr_all_shoulder4_l2so_train_test_datasets.rds")
+```
+
+```{r}
+feature_list <- list()
+all_features <- c()
+
+for (i in seq_along(data_sub_list))
+  {
+    data <- data_list[[i]]$train_data
+    cor_matrix <- mixedCor(data=data, c=15:68, d=6)$rho
+    cfeatures <- data.frame(cor_matrix) |> select (State)
+    cfeatures_indices <- apply(cfeatures, 2, function(x) which(abs(x) >= 0.2))
+    cfeature_names <- rownames(cfeatures_indices)[-1]
+
+    feature_list[[i]] <- cfeature_names
+    all_features <- c(all_features, unlist(cfeature_names))
+}
+
+sort(table(all_features), decreasing = TRUE)
+```
+```
+
