@@ -68,8 +68,8 @@ for (i in seq(ncol(combinations))) {
 ```
 
 ```{r}
-# saveRDS(train_test_datasets, file = "lconsvftall_l2so_train_test_datasets.rds")
-# saveRDS(train_test_sub_datasets, file ="sconsvftall_l2so_train_test_datasets.rds")
+saveRDS(train_test_datasets, file = "lconsvftall_l2so_train_test_datasets.rds")
+saveRDS(train_test_sub_datasets, file ="sconsvftall_l2so_train_test_datasets.rds")
 ```
 
 ## Select sensor features that have >=0.2 correlations with fatigue state.
@@ -195,5 +195,48 @@ for (i in seq_along(data_sub_list))
 
 sort(table(all_features), decreasing = TRUE)
 ```
+
+# Robustness check of feature selection
+## Univariate time-dependent cox
+```{r}
+sname <- paste0(".rds") # short l2so cv folds
+lname <- paste0(".rds") # long l2so cv folds
+data_sub_list <- readRDS(sname)
+data_list <- readRDS(lname)
+nfold <- length(data_sub_list)
 ```
 
+```{r}
+# List of variables to test
+names(long_data)
+x <- long_data[,10:72] # sensor features columns
+variable_list <- names(x)
+variable_list
+
+features_selected <- list()
+for (i in seq_along(data_list)) {
+  d <- data_list[[i]]$train_data
+ 
+# Perform univariate Cox regression for each variable and extract p-values
+p_values <- sapply(variable_list, function(variable) {
+  cox_model <- coxph(Surv(Time1, Time2, State) ~ get(variable), data = d, cluster=ID) # Index
+  summary(cox_model)$coefficients[1, "Pr(>|z|)"]
+})
+
+# Set a significance level (e.g., 0.05) for filtering
+significance_level <- 0.05
+
+# Filter variables based on p-values
+selected_variables <- variable_list[p_values < significance_level]
+
+  features_selected[[i]] <- selected_variables
+}
+
+features <- unlist(features_selected)
+
+library(dplyr)
+sorted_df <- as.data.frame(table(features)) %>%
+  arrange(desc(Freq))
+
+sorted_df # frequency of each feature been selected acrosss folds
+```
